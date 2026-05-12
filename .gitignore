@@ -210,3 +210,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# .gitignore
+dms_session_log.csv
+__pycache__/
+*.pyc
+.env
