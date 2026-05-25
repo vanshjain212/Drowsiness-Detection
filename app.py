@@ -98,7 +98,10 @@ if video_path is not None or uploaded_file is not None:
         event_log = []         # Low-frequency data for CSV export
         frame_count = 0
 
-        base_options = python.BaseOptions(model_asset_path='face_landmarker.task')
+        base_options = python.BaseOptions(
+            model_asset_path='face_landmarker.task',
+            delegate=python.BaseOptions.Delegate.CPU
+            )        
         options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
         
         with vision.FaceLandmarker.create_from_options(options) as detector:
