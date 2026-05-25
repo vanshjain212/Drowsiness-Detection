@@ -8,7 +8,7 @@ import tempfile
 import os
 import pandas as pd
 import datetime
-
+import time
 # --- IMPORT MODULAR LOGIC ---
 from detection import calculate_ear, calculate_mar
 
@@ -184,7 +184,11 @@ if video_path is not None or uploaded_file is not None:
                     "Event": current_event
                 })
 
-                frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                # --- PREVENT WEBSOCKET FLOODING ---
+                # Only send every 3rd frame to the web browser to keep the video playing smoothly
+                if frame_count % 3 == 0:
+                    frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                    time.sleep(0.01) # Give the React frontend 10ms to render the image
                 
             cap.release()
             
