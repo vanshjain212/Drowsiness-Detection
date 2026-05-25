@@ -186,9 +186,19 @@ if video_path is not None or uploaded_file is not None:
 
                 # --- PREVENT WEBSOCKET FLOODING ---
                 # Only send every 3rd frame to the web browser to keep the video playing smoothly
+                # --- HIGH-EFFICIENCY GRAPHICS RENDERING ---
+                # 1. Skip visual rendering for 2 out of every 3 frames to clear the WebSocket queue
                 if frame_count % 3 == 0:
-                    frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-                    time.sleep(0.01) # Give the React frontend 10ms to render the image
+                    # 2. Downscale frame resolution slightly to massively decrease internet payload size
+                    preview_h, preview_w, _ = frame.shape
+                    preview_resized = cv2.resize(frame, (int(preview_w * 0.7), int(preview_h * 0.7)))
+                    
+                    # 3. Convert and send to the container player
+                    rgb_preview = cv2.cvtColor(preview_resized, cv2.COLOR_BGR2RGB)
+                    frame_placeholder.image(rgb_preview, channels="RGB", use_container_width=True)
+                    
+                    # 4. Give the React engine a tiny breathing window to repaint the browser page
+                    time.sleep(0.03)
                 
             cap.release()
             
