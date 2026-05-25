@@ -74,147 +74,113 @@ if video_path is not None or uploaded_file is not None:
     if not os.path.exists(target_video) and uploaded_file is None:
         st.error(f"Error: Could not find '{target_video}'. Please ensure the video is in the 'data/' folder.")
     else:
-        st.markdown("---")
-        col_video, col_metrics = st.columns([2, 1])
-        
-        with col_video:
-            st.subheader("Live Video Feed")
-            frame_placeholder = st.empty()
-            progress_bar = st.progress(0)
-            
-        with col_metrics:
-            st.subheader("Real-Time Telemetry")
-            metric_drowsy = st.metric("Drowsy Events Detected", "0")
-            metric_yawn = st.metric("Yawn Events Detected", "0")
-            metric_risk = st.metric("Fatigue Risk Score", "0%")
-        
-        # --- STATE VARIABLES & DEBOUNCING ---
+        # --- STATE VARIABLES ---
         drowsy_frames = 0
         total_yawn_alerts = 0
         total_drowsy_alerts = 0
         yawn_cooldown = 0
         drowsy_flag = False
-        
-        # --- DATA SEPARATION ---
-        session_telemetry = [] # High-frequency data for UI charts
-        event_log = []         # Low-frequency data for CSV export
+        session_telemetry = []
+        event_log = []
         frame_count = 0
 
-        # --- CLOUD-SAFE MEDIAPIPE CONFIG ---
-        # Explicitly force the CPU delegate to prevent headless graphics crashes
-        base_options = python.BaseOptions(
-            model_asset_path='face_landmarker.task',
-            delegate=python.BaseOptions.Delegate.CPU
-        )
-        options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
-        
-        with vision.FaceLandmarker.create_from_options(options) as detector:
-            cap = cv2.VideoCapture(target_video)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # --- 1. BATCH PROCESSING PHASE (NO UI UPDATES) ---
+        with st.spinner("🧠 AI is analyzing the footage... please wait."):
             
-            # FPS CALCULATION FOR SMOOTH PLAYBACK
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            if fps == 0 or math.isnan(fps):
-                fps = 30.0
-            frame_delay = 1.0 / fps
+            # Explicitly force the CPU delegate to prevent headless graphics crashes on cloud
+            base_options = python.BaseOptions(
+                model_asset_path='face_landmarker.task', 
+                delegate=python.BaseOptions.Delegate.CPU
+            )
+            options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
             
-            while cap.isOpened():
-                loop_start_time = time.time()
+            with vision.FaceLandmarker.create_from_options(options) as detector:
+                cap = cv2.VideoCapture(target_video)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
                 
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                frame_count += 1
-                if total_frames > 0:
-                    progress_bar.progress(min(frame_count / total_frames, 1.0))
-                
-                h, w, _ = frame.shape
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-                detection_result = detector.detect(mp_image)
-                
-                current_ear = 0.0
-                current_mar = 0.0
-                current_event = "Normal"
-                
-                if detection_result.face_landmarks:
-                    for face_landmarks in detection_result.face_landmarks:
-                        e_l = calculate_ear(face_landmarks, left_eye, w, h)
-                        e_r = calculate_ear(face_landmarks, right_eye, w, h)
-                        current_ear = (e_l + e_r) / 2.0
-                        current_mar = calculate_mar(face_landmarks, mouth, w, h)
-                        
-                        # --- 1. DROWSY LOGIC ---
-                        if current_ear < ear_threshold:
-                            drowsy_frames += 1
-                            if drowsy_frames >= consec_frames:
-                                cv2.putText(frame, "ALERT: DROWSY", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 3)
-                                current_event = "Drowsy"
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    
+                    frame_count += 1
+                    h, w, _ = frame.shape
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+                    detection_result = detector.detect(mp_image)
+                    
+                    current_ear = 0.0
+                    current_mar = 0.0
+                    current_event = "Normal"
+                    
+                    if detection_result.face_landmarks:
+                        for face_landmarks in detection_result.face_landmarks:
+                            e_l = calculate_ear(face_landmarks, left_eye, w, h)
+                            e_r = calculate_ear(face_landmarks, right_eye, w, h)
+                            current_ear = (e_l + e_r) / 2.0
+                            current_mar = calculate_mar(face_landmarks, mouth, w, h)
+                            
+                            # --- DROWSY LOGIC ---
+                            if current_ear < ear_threshold:
+                                drowsy_frames += 1
+                                if drowsy_frames >= consec_frames:
+                                    current_event = "Drowsy"
+                                    if not drowsy_flag:
+                                        total_drowsy_alerts += 1
+                                        drowsy_flag = True
+                                        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                        event_log.append({"Timestamp": timestamp, "Event": "DROWSY", "Value": current_ear, "Threshold": ear_threshold})
+                            else:
+                                drowsy_frames = 0
+                                drowsy_flag = False
                                 
-                                if not drowsy_flag:
-                                    total_drowsy_alerts += 1
-                                    drowsy_flag = True
+                            # --- YAWN LOGIC (WITH DEBOUNCING) ---
+                            if yawn_cooldown > 0: 
+                                yawn_cooldown -= 1
+                                
+                            if current_mar > mar_threshold:
+                                if current_event == "Normal": 
+                                    current_event = "Yawn"
+                                if yawn_cooldown == 0:
+                                    total_yawn_alerts += 1
+                                    yawn_cooldown = int(fps * 1.5) # Lock out for ~1.5 seconds
                                     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    event_log.append({"Timestamp": timestamp, "Event": "DROWSY", "Value": current_ear, "Threshold": ear_threshold})
-                        else:
-                            drowsy_frames = 0
-                            drowsy_flag = False
-                            
-                        # --- 2. YAWN LOGIC (WITH DEBOUNCING) ---
-                        if yawn_cooldown > 0:
-                            yawn_cooldown -= 1
-                            
-                        if current_mar > mar_threshold:
-                            cv2.putText(frame, "WARNING: YAWNING", (30, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 165, 0), 3)
-                            if current_event == "Normal": 
-                                current_event = "Yawn"
-                                
-                            if yawn_cooldown == 0:
-                                total_yawn_alerts += 1
-                                yawn_cooldown = int(fps * 1.5) # Lock out for ~1.5 seconds based on dynamic FPS
-                                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                event_log.append({"Timestamp": timestamp, "Event": "YAWN", "Value": current_mar, "Threshold": mar_threshold})
+                                    event_log.append({"Timestamp": timestamp, "Event": "YAWN", "Value": current_mar, "Threshold": mar_threshold})
 
-                        # Calculate dynamic risk score
-                        risk_score = min(100, (total_yawn_alerts * 15) + (total_drowsy_alerts * 35))
-
-                        # Update UI Metrics dynamically
-                        metric_drowsy.metric("Drowsy Events Detected", str(total_drowsy_alerts))
-                        metric_yawn.metric("Yawn Events Detected", str(total_yawn_alerts))
-                        metric_risk.metric("Fatigue Risk Score", f"{risk_score}%")
-
-                # Log high-frequency data for the charts
-                session_telemetry.append({
-                    "Frame": frame_count,
-                    "EAR": current_ear,
-                    "MAR": current_mar,
-                    "Event": current_event
-                })
-
-                # --- OPTIMIZED VIDEO RENDERING ---
-                # Only render every 2nd frame, downscale resolution by 30% to clear WebSocket traffic
-                if frame_count % 2 == 0:
-                    preview_resized = cv2.resize(frame, (int(w * 0.7), int(h * 0.7)))
-                    frame_placeholder.image(cv2.cvtColor(preview_resized, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                    # Log high-frequency data for charts
+                    session_telemetry.append({
+                        "Frame": frame_count, 
+                        "EAR": current_ear, 
+                        "MAR": current_mar, 
+                        "Event": current_event
+                    })
                 
-                # --- FPS THROTTLING ---
-                # Force the cloud CPU to process the video at human-speed, preventing freezing
-                processing_time = time.time() - loop_start_time
-                sleep_time = max(0.0, frame_delay - processing_time)
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
-                
-            cap.release()
-            
-        # --- POST-PROCESSING ANALYTICS DASHBOARD ---
+                cap.release()
+
+        # --- 2. THE NEW ARCHITECTURE (RENDER PHASE) ---
         st.success("✅ Analysis Complete!")
+        st.markdown("---")
+        
+        col_video, col_metrics = st.columns([2, 1])
+        
+        with col_video:
+            st.subheader("Dashcam Footage")
+            # Plays flawlessly using the browser's native video engine
+            st.video(target_video)
+            
+        with col_metrics:
+            st.subheader("Session Telemetry")
+            risk_score = min(100, (total_yawn_alerts * 15) + (total_drowsy_alerts * 35))
+            
+            st.metric("Drowsy Events Detected", str(total_drowsy_alerts))
+            st.metric("Yawn Events Detected", str(total_yawn_alerts))
+            st.metric("Fatigue Risk Score", f"{risk_score}%")
+            
+        # --- POST-PROCESSING CHARTS ---
         st.markdown("---")
         st.subheader("📊 Post-Drive Session Analytics")
         
-        # Convert frame-by-frame memory list to Pandas DataFrame for Charts
         chart_df = pd.DataFrame(session_telemetry)
-        
         chart_col1, chart_col2 = st.columns(2)
         
         with chart_col1:
@@ -228,7 +194,7 @@ if video_path is not None or uploaded_file is not None:
                 st.bar_chart(event_counts, color="#ff4b4b")
             else:
                 st.info("No fatigue events detected during this session.")
-        
+
         # --- THE CLEAN CSV EXPORT ---
         event_df = pd.DataFrame(event_log)
         if event_df.empty:
@@ -242,6 +208,6 @@ if video_path is not None or uploaded_file is not None:
             mime="text/csv",
         )
 
-        # Clean up temporary file if uploaded
+        # Cleanup temporary file if uploaded
         if uploaded_file is not None:
             os.remove(target_video)
