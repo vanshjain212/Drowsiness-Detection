@@ -9,6 +9,8 @@ import os
 import pandas as pd
 import datetime
 import time
+import math
+
 # --- IMPORT MODULAR LOGIC ---
 from detection import calculate_ear, calculate_mar
 
@@ -90,7 +92,7 @@ if video_path is not None or uploaded_file is not None:
         drowsy_frames = 0
         total_yawn_alerts = 0
         total_drowsy_alerts = 0
-        yawn_cooldown = 0   # Cooldown timer to prevent double-counting yawns
+        yawn_cooldown = 0
         drowsy_flag = False
         
         # --- DATA SEPARATION ---
@@ -98,17 +100,27 @@ if video_path is not None or uploaded_file is not None:
         event_log = []         # Low-frequency data for CSV export
         frame_count = 0
 
+        # --- CLOUD-SAFE MEDIAPIPE CONFIG ---
+        # Explicitly force the CPU delegate to prevent headless graphics crashes
         base_options = python.BaseOptions(
             model_asset_path='face_landmarker.task',
             delegate=python.BaseOptions.Delegate.CPU
-            )        
+        )
         options = vision.FaceLandmarkerOptions(base_options=base_options, num_faces=1)
         
         with vision.FaceLandmarker.create_from_options(options) as detector:
             cap = cv2.VideoCapture(target_video)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
+            # FPS CALCULATION FOR SMOOTH PLAYBACK
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps == 0 or math.isnan(fps):
+                fps = 30.0
+            frame_delay = 1.0 / fps
+            
             while cap.isOpened():
+                loop_start_time = time.time()
+                
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -143,8 +155,6 @@ if video_path is not None or uploaded_file is not None:
                                 if not drowsy_flag:
                                     total_drowsy_alerts += 1
                                     drowsy_flag = True
-                                    
-                                    # Log the discrete event for the CSV
                                     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                     event_log.append({"Timestamp": timestamp, "Event": "DROWSY", "Value": current_ear, "Threshold": ear_threshold})
                         else:
@@ -162,9 +172,7 @@ if video_path is not None or uploaded_file is not None:
                                 
                             if yawn_cooldown == 0:
                                 total_yawn_alerts += 1
-                                yawn_cooldown = 45 # Lock out other yawns for ~1.5 seconds
-                                
-                                # Log the discrete event for the CSV
+                                yawn_cooldown = int(fps * 1.5) # Lock out for ~1.5 seconds based on dynamic FPS
                                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                                 event_log.append({"Timestamp": timestamp, "Event": "YAWN", "Value": current_mar, "Threshold": mar_threshold})
 
@@ -184,21 +192,18 @@ if video_path is not None or uploaded_file is not None:
                     "Event": current_event
                 })
 
-                # --- PREVENT WEBSOCKET FLOODING ---
-                # Only send every 3rd frame to the web browser to keep the video playing smoothly
-                # --- HIGH-EFFICIENCY GRAPHICS RENDERING ---
-                # 1. Skip visual rendering for 2 out of every 3 frames to clear the WebSocket queue
-                if frame_count % 3 == 0:
-                    # 2. Downscale frame resolution slightly to massively decrease internet payload size
-                    preview_h, preview_w, _ = frame.shape
-                    preview_resized = cv2.resize(frame, (int(preview_w * 0.7), int(preview_h * 0.7)))
-                    
-                    # 3. Convert and send to the container player
-                    rgb_preview = cv2.cvtColor(preview_resized, cv2.COLOR_BGR2RGB)
-                    frame_placeholder.image(rgb_preview, channels="RGB", use_container_width=True)
-                    
-                    # 4. Give the React engine a tiny breathing window to repaint the browser page
-                    time.sleep(0.03)
+                # --- OPTIMIZED VIDEO RENDERING ---
+                # Only render every 2nd frame, downscale resolution by 30% to clear WebSocket traffic
+                if frame_count % 2 == 0:
+                    preview_resized = cv2.resize(frame, (int(w * 0.7), int(h * 0.7)))
+                    frame_placeholder.image(cv2.cvtColor(preview_resized, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
+                
+                # --- FPS THROTTLING ---
+                # Force the cloud CPU to process the video at human-speed, preventing freezing
+                processing_time = time.time() - loop_start_time
+                sleep_time = max(0.0, frame_delay - processing_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
                 
             cap.release()
             
@@ -227,7 +232,6 @@ if video_path is not None or uploaded_file is not None:
         # --- THE CLEAN CSV EXPORT ---
         event_df = pd.DataFrame(event_log)
         if event_df.empty:
-            # Ensure columns exist even if no events happened
             event_df = pd.DataFrame(columns=["Timestamp", "Event", "Value", "Threshold"])
             
         csv_data = event_df.to_csv(index=False).encode('utf-8')
